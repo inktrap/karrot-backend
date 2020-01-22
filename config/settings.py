@@ -100,6 +100,7 @@ INSTALLED_APPS = (
     'karrot.webhooks.WebhooksConfig',
     'karrot.notifications.NotificationsConfig',
     'karrot.stats',
+    'karrot.status.StatusConfig',
 
     # Django packages
     'django_extensions',
