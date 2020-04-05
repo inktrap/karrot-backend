@@ -243,11 +243,9 @@ class ConversationThreadReceiverTests(WSTestCase):
         thread = conversation.messages.create(author=user, content='yay')
 
         # login and connect
-        print('connect')
         client = self.connect_as(user)
         author_client = self.connect_as(author)
 
-        print('create another reply')
         reply = ConversationMessage.objects.create(
             conversation=conversation,
             thread=thread,
@@ -465,11 +463,26 @@ class GroupMembershipReceiverTests(WSTestCase):
         self.assertEqual([m['topic'] for m in client.messages], [
             'history:history',
             'conversations:leave',
-            'status',
             'conversations:conversation',
             'status',
             'groups:group_preview',
         ])
+
+        status_messages = client.messages_by_topic['status']
+        self.assertEqual(len(status_messages), 1, status_messages)
+        self.assertEqual(
+            status_messages[0]['payload'], {
+                'unseen_conversation_count': 0,
+                'unseen_thread_count': 0,
+                'has_unread_conversations_or_threads': False,
+                'groups': {
+                    self.group.id: {
+                        'unread_wall_message_count': 0
+                    }
+                },
+                'places': {},
+            }
+        )
 
     def test_receive_group_roles_update(self):
         membership = self.group.add_member(self.user)
@@ -494,19 +507,23 @@ class ApplicationReceiverTests(WSTestCase):
         self.member = UserFactory()
         self.user = UserFactory()
         self.group = GroupFactory(members=[self.member])
-
-    def application_update_messages(self):
-        return [r for r in self.client.messages if r['topic'] == 'applications:update']
+        Notification.objects.all().delete()
 
     def test_member_receives_application_create(self):
         self.client = self.connect_as(self.member)
 
         application = ApplicationFactory(user=self.user, group=self.group)
 
-        messages = self.application_update_messages()
+        messages = self.client.messages_by_topic['applications:update']
         self.assertEqual(len(messages), 1)
-        response = messages[0]
-        self.assertEqual(response['payload']['id'], application.id)
+        self.assertEqual(messages[0]['payload']['id'], application.id)
+
+        messages = self.client.messages_by_topic['status']
+        self.assertEqual(len(messages), 2, messages)
+        # We told the user that we have 1 pending application
+        self.assertEqual(messages[0]['payload'], {'groups': {self.group.id: {'pending_application_count': 1}}})
+        # "There is an application for your group!"
+        self.assertEqual(messages[1]['payload'], {'unseen_notification_count': 1})
 
     def test_member_receives_application_update(self):
         application = ApplicationFactory(user=self.user, group=self.group)
@@ -516,23 +533,36 @@ class ApplicationReceiverTests(WSTestCase):
         application.status = 'accepted'
         application.save()
 
-        messages = self.application_update_messages()
+        messages = self.client.messages_by_topic['applications:update']
         self.assertEqual(len(messages), 1)
         response = messages[0]
         self.assertEqual(response['payload']['id'], application.id)
 
+        messages = self.client.messages_by_topic['status']
+        self.assertEqual(len(messages), 2, messages)
+        # No pending applications
+        self.assertEqual(messages[1]['payload'], {'groups': {self.group.id: {'pending_application_count': 0}}})
+        # Notification gets deleted because application has been accepted
+        self.assertEqual(messages[0]['payload'], {'unseen_notification_count': 0})
+
     def test_applicant_receives_application_update(self):
         application = ApplicationFactory(user=self.user, group=self.group)
+        Notification.objects.all().delete()
 
         self.client = self.connect_as(self.user)
 
         application.status = 'accepted'
         application.save()
 
-        messages = self.application_update_messages()
+        messages = self.client.messages_by_topic['applications:update']
         self.assertEqual(len(messages), 1)
         response = messages[0]
         self.assertEqual(response['payload']['id'], application.id)
+
+        messages = self.client.messages_by_topic['status']
+        self.assertEqual(len(messages), 1, messages)
+        # "Your application has been accepted"
+        self.assertEqual(messages[0]['payload'], {'unseen_notification_count': 1})
 
 
 class InvitationReceiverTests(WSTestCase):
@@ -740,6 +770,15 @@ class FeedbackReceiverTests(WSTestCase):
             'status',
         ], self.client.messages)
 
+        self.assertEqual(
+            self.client.messages_by_topic['status'][0]['payload'],
+            {'groups': {
+                self.group.id: {
+                    'feedback_possible_count': 0
+                }
+            }}
+        )
+
 
 class FinishedPickupReceiverTest(WSTestCase):
     def setUp(self):
@@ -753,6 +792,8 @@ class FinishedPickupReceiverTest(WSTestCase):
         self.pickup.date = to_range(timezone.now() - relativedelta(days=1))
         self.pickup.save()
 
+        Notification.objects.all().delete()
+
         self.client = self.connect_as(self.member)
         PickupDate.objects.process_finished_pickup_dates()
 
@@ -764,8 +805,12 @@ class FinishedPickupReceiverTest(WSTestCase):
         response = messages_by_topic['notifications:notification'][0]
         self.assertEqual(response['payload']['type'], 'feedback_possible')
 
+        status_messages = messages_by_topic['status']
+        self.assertEqual(len(status_messages), 2)
+        self.assertEqual(status_messages[0]['payload'], {'unseen_notification_count': 1})
+        self.assertEqual(status_messages[1]['payload'], {'groups': {self.group.id: {'feedback_possible_count': 1}}})
+
         self.assertEqual(len(self.client.messages), 4, self.client.messages)
-        self.assertEqual(len(messages_by_topic['status']), 2)
 
 
 class UserReceiverTest(WSTestCase):

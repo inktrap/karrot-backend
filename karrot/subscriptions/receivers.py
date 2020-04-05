@@ -521,47 +521,44 @@ def send_conversation_status_update(subscriptions, conversation=None):
                 payload['places'][target_id] = {'unread_wall_message_count': 0}
 
         for subscription in subscriptions:
-            print('send to', subscription.user, payload)
             send_in_channel(subscription.reply_channel, topic='status', payload=payload)
 
 
 @receiver(post_save, sender=Conversation)
 def conversation_saved(sender, instance, **kwargs):
     # latest_message changed -> a new message has been sent!
-    # TODO exclude author, their counts don't change
-    # TODO don't send if latest_message didn't change
     conversation = instance
-    print('conversation_saved')
+    if conversation.latest_message_id is None or 'latest_message' not in conversation.get_dirty_fields():
+        return
+
     send_conversation_status_update(
-        ChannelSubscription.objects.recent().filter(user__in=conversation.participants.all()).distinct(),
+        ChannelSubscription.objects.recent().filter(
+            user__in=conversation.participants.exclude(conversation.latest_message.author)
+        ).distinct(),
         conversation,
     )
 
 
 @receiver(post_save, sender=ConversationMessage)
 def conversation_thread_saved(sender, instance, **kwargs):
+    # latest_message changed -> a new reply has been sent!
     thread = instance
 
-    if thread.latest_message is None:
-        # not a thread
+    if thread.latest_message_id is None or 'latest_message' not in thread.get_dirty_fields():
+        # not a thread or latest message not changed
         return
 
-    print('conversation_thread_saved')
-
-    # latest_message changed -> a new reply has been sent!
-    # TODO exclude author, their counts don't change
     # TODO only send to thread participants
-    # TODO don't send if latest_message didn't change
     send_conversation_status_update(
-        ChannelSubscription.objects.recent().filter(user__in=thread.conversation.participants.all()).distinct(),
+        ChannelSubscription.objects.recent().filter(
+            user__in=thread.conversation.participants.exclude(thread.latest_message.author)
+        ).distinct(),
     )
 
 
 @receiver(post_save, sender=ConversationMeta)
 def conversation_meta_saved_again(sender, instance, **kwargs):
     # user opened the latest messages menu
-
-    print('conversation_meta_saved')
     meta = instance
     send_conversation_status_update(ChannelSubscription.objects.recent().filter(user=meta.user))
 
@@ -569,12 +566,11 @@ def conversation_meta_saved_again(sender, instance, **kwargs):
 @receiver(post_save, sender=ConversationParticipant)
 def conversation_participant_saved(sender, instance, **kwargs):
     # user marked a message as read
-    # TODO exclude author, their counts don't change
     participant = instance
     if 'seen_up_to' not in participant.get_dirty_fields():
         return
+
     conversation = participant.conversation
-    print('conversation_participant_saved')
     send_conversation_status_update(
         ChannelSubscription.objects.recent().filter(user=participant.user).distinct(),
         conversation,
@@ -584,12 +580,10 @@ def conversation_participant_saved(sender, instance, **kwargs):
 @receiver(post_save, sender=ConversationThreadParticipant)
 def conversation_thread_participant_saved(sender, instance, **kwargs):
     # user marked a message as read
-    # TODO exclude author, their counts don't change
-    # TODO don't send if seen_up_to doesn't change
     participant = instance
     if 'seen_up_to' not in participant.get_dirty_fields():
         return
-    print('conversation_thread_participant_saved')
+
     send_conversation_status_update(ChannelSubscription.objects.recent().filter(user=participant.user).distinct())
 
 
@@ -597,7 +591,6 @@ def conversation_thread_participant_saved(sender, instance, **kwargs):
 def conversation_participant_deleted(sender, instance, **kwargs):
     # user unsubscribed from the conversation
     participant = instance
-    print('conversation_participant_deleted')
     send_conversation_status_update(
         ChannelSubscription.objects.recent().filter(user=participant.user),
         participant.conversation,
@@ -607,28 +600,29 @@ def conversation_participant_deleted(sender, instance, **kwargs):
 @receiver(post_save, sender=Notification)
 @receiver(post_delete, sender=Notification)
 def notification_changed(sender, instance, **kwargs):
-    # TODO group by user
     notification = instance
+    count = unseen_notification_count(notification.user)
     for subscription in ChannelSubscription.objects.recent().filter(user=notification.user):
         send_in_channel(
-            subscription.reply_channel,
-            topic='status',
-            payload={
-                'unseen_notification_count': unseen_notification_count(subscription.user),
+            subscription.reply_channel, topic='status', payload={
+                'unseen_notification_count': count,
             }
         )
 
 
 @receiver(post_save, sender=Application)
 def application_saved(sender, instance, **kwargs):
-    # TODO group by user
     application = instance
-    for subscription in ChannelSubscription.objects.recent().filter(user__in=application.group.members.all()):
+    for user, subscriptions in groupby(sorted(list(
+            ChannelSubscription.objects.recent().filter(user__in=application.group.members.all())),
+                                              key=lambda x: x.user.id), key=lambda x: x.user):
+
         groups = defaultdict(dict)
-        for group_id, count in pending_applications(subscription.user):
+        for group_id, count in pending_applications(user):
             groups[group_id]['pending_application_count'] = count
 
-        send_in_channel(subscription.reply_channel, topic='status', payload={'groups': groups})
+        for subscription in subscriptions:
+            send_in_channel(subscription.reply_channel, topic='status', payload={'groups': groups})
 
 
 @receiver(post_save, sender=PickupDate)
@@ -639,12 +633,16 @@ def pickup_date_saved(sender, instance, **kwargs):
         # Pickup is not done or was already marked as done before
         return
 
-    for subscription in ChannelSubscription.objects.recent().filter(user__in=pickup.collectors.all()):
+    for user, subscriptions in groupby(sorted(list(
+            ChannelSubscription.objects.recent().filter(user__in=pickup.collectors.all())), key=lambda x: x.user.id),
+                                       key=lambda x: x.user):
+
         groups = defaultdict(dict)
-        for group_id, count in get_feedback_possible(subscription.user):
+        for group_id, count in get_feedback_possible(user):
             groups[group_id]['feedback_possible_count'] = count
 
-        send_in_channel(subscription.reply_channel, topic='status', payload={'groups': groups})
+        for subscription in subscriptions:
+            send_in_channel(subscription.reply_channel, topic='status', payload={'groups': groups})
 
 
 @receiver(post_save, sender=Feedback)
@@ -654,9 +652,13 @@ def feedback_saved(sender, instance, created, **kwargs):
     if not created:
         return
 
-    for subscription in ChannelSubscription.objects.recent().filter(user=feedback.given_by):
-        groups = defaultdict(dict)
-        for group_id, count in get_feedback_possible(subscription.user):
-            groups[group_id]['feedback_possible_count'] = count
+    user = feedback.given_by
 
-        send_in_channel(subscription.reply_channel, topic='status', payload={'groups': groups})
+    groups = defaultdict(dict)
+    for group_id, count in get_feedback_possible(user):
+        groups[group_id]['feedback_possible_count'] = count
+
+    payload = {'groups': groups}
+
+    for subscription in ChannelSubscription.objects.recent().filter(user=user):
+        send_in_channel(subscription.reply_channel, topic='status', payload=payload)

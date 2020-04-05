@@ -51,7 +51,7 @@ class ConversationQuerySet(models.QuerySet):
                            Q(group__groupmembership__user=user, is_group_public=True)).distinct()
 
 
-class Conversation(BaseModel, UpdatedAtMixin):
+class Conversation(BaseModel, UpdatedAtMixin, DirtyFieldsMixin):
     """A conversation between one or more users."""
     class Meta:
         unique_together = ('target_type', 'target_id')
@@ -250,7 +250,7 @@ class ConversationMessageManager(BaseManager.from_queryset(ConversationMessageQu
         return obj
 
 
-class ConversationMessage(BaseModel, UpdatedAtMixin):
+class ConversationMessage(BaseModel, UpdatedAtMixin, DirtyFieldsMixin):
     """A message in the conversation by a particular user."""
 
     objects = ConversationMessageManager()
